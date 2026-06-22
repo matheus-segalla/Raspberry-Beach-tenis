@@ -69,27 +69,52 @@ def autenticar_e_ativar_totem():
         return False
 
 def iniciar_buffer_circular():
-    """Inicia o FFmpeg em segundo plano adaptando-se para Windows ou Raspberry Pi (Linux)."""
-    if os.name == 'nt':  # Windows
-        camera_input = f"video={os.getenv('CAMERA_NOME', 'Logi C270 HD WebCam')}"
-        formato_input = 'dshow'
-        cmd_input = ['-f', formato_input, '-i', camera_input]
-    else:  # 🍓 Raspberry Pi / Linux
-        # No Raspberry Pi, o dispositivo padrão da primeira câmera USB conectada é '/dev/video0'
-        camera_input = os.getenv('CAMERA_NOME', '/dev/video0')
-        formato_input = 'v4l2' # Driver oficial de vídeo do Linux
-        cmd_input = ['-f', formato_input, '-i', camera_input]
+    """Inicia o FFmpeg adaptando-se inteligentemente para Câmeras IP (RTSP) ou USB."""
+    camera_input = os.getenv('CAMERA_NOME', 'rtsp://admin:SuaSenhaAqui@XXXX:554/Streaming/Channels/101')
+    pasta_seg = os.getenv('PASTA_SEGMENTOS', './segmentos')
+    tempo_seg = os.getenv('TEMPO_SEGMENTO', '5')
+    qtd_seg = os.getenv('QUANTIDADE_SEGMENTOS', '12')
 
-    comando = [
-        FFMPEG_EXEC, *cmd_input, # Utiliza a variável dinâmica sem o .exe no Linux
-        '-s', os.getenv('RESOLUCAO'), '-r', os.getenv('FPS'),
-        '-c:v', 'libx264', '-f', 'segment',
-        '-segment_time', os.getenv('TEMPO_SEGMENTO'),
-        '-segment_wrap', os.getenv('QUANTIDADE_SEGMENTOS'),
-        '-reset_timestamps', '1', '-y',
-        f"{os.getenv('PASTA_SEGMENTOS')}/video_%03d.mp4"
-    ]
-    return subprocess.Popen(comando, shell=True)
+    # 🌐 SE FOR UMA CÂMERA IP (HIKVISION / RTSP)
+    if camera_input.startswith('rtsp://'):
+        print(f"📡 [REDE] Conectando ao fluxo de vídeo da Câmera IP Hikvision...")
+        print(f"🔗 URL Alvo: {camera_input}")
+        
+        comando = [
+            FFMPEG_EXEC,
+            '-rtsp_transport', 'tcp',  # Força conexão estável via TCP sem perda de pacotes
+            '-i', camera_input,
+            '-c:v', 'copy',            # ⚡ MÁGICA: Copia o H.264 bruto da Hikvision. O uso de CPU no Pi 3B cai para ~2%
+            '-f', 'segment',
+            '-segment_time', tempo_seg,
+            '-segment_wrap', qtd_seg,
+            '-reset_timestamps', '1',
+            '-y',
+            f"{pasta_seg}/video_%03d.mp4"
+        ]
+        return subprocess.Popen(comando, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 🔌 SE FOR WEBCAM USB COMUM (LOGITECH, ETC)
+    else:
+        print(f"🔌 [USB] Conectando à Webcam USB nativa...")
+        resolucao = os.getenv('RESOLUCAO', '1280x720')
+        fps = os.getenv('FPS', '30')
+
+        if os.name == 'nt':  # Windows
+            cmd_input = ['-f', 'dshow', '-i', f"video={camera_input}"]
+        else:  # 🍓 Raspberry Pi / Linux
+            cmd_input = ['-f', 'v4l2', '-i', camera_input]
+
+        comando = [
+            FFMPEG_EXEC, *cmd_input,
+            '-s', resolucao, '-r', fps,
+            '-c:v', 'libx264', '-f', 'segment',
+            '-segment_time', tempo_seg,
+            '-segment_wrap', qtd_seg,
+            '-reset_timestamps', '1', '-y',
+            f"{pasta_seg}/video_%03d.mp4"
+        ]
+        return subprocess.Popen(comando, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def adicionar_a_fila():
     """Adiciona um novo pedido de replay no arquivo queue.json."""
@@ -137,8 +162,8 @@ def processar_fila_de_replays():
     tarefa["status_video"] = "processando"
     with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
 
-    pasta_seg = os.getenv('PASTA_SEGMENTOS')
-    arquivo_final = f"{os.getenv('PASTA_REPLAYS')}/replay_{tarefa['id']}.mp4"
+    pasta_seg = os.getenv('PASTA_SEGMENTOS', './segmentos')
+    arquivo_final = f"{os.getenv('PASTA_REPLAYS', './replays')}/replay_{tarefa['id']}.mp4"
     lista_txt_path = f"lista_{tarefa['id']}.txt"
 
     try:
@@ -151,9 +176,8 @@ def processar_fila_de_replays():
                 for seg in ultimos_segmentos:
                     f.write(f"file '{os.path.join(pasta_seg, seg).replace('\\', '/')}'\n")
 
-            # 🚀 AJUSTADO AQUI TAMBÉM O PROCESSO DE CONCATENAÇÃO DO LINUX
             comando_concat = [FFMPEG_EXEC, '-f', 'concat', '-safe', '0', '-i', lista_txt_path, '-c', 'copy', '-y', arquivo_final]
-            subprocess.run(comando_concat, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(comando_concat, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             if os.path.exists(lista_txt_path): os.remove(lista_txt_path)
 
@@ -249,7 +273,6 @@ def executar_upload_da_fila():
                 if os.name == 'nt':
                     os.startfile(caminho_qr)
                 else:
-                    # Executa o visualizador de imagens padrão do Linux
                     subprocess.Popen(['xdg-open', caminho_qr])
                 
                 print("📺 [QR CODE] Exibido na tela com sucesso!\n")
@@ -263,6 +286,7 @@ def executar_upload_da_fila():
 
     except Exception as e:
         print(f"📡 [REDE] Erro crítico no processo: {e}")
+        # 🛠️ CORRIGIDO: Era 'farefa', mudado para 'tarefa'
         tarefa["status_upload"] = "erro_rede"
 
     with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
@@ -273,7 +297,6 @@ def executar_upload_da_fila():
 if autenticar_e_ativar_totem():
     print("Pressione [ESPAÇO] para salvar uma jogada. Pressione [ESC] para sair.\n")
     
-    # Inicia a gravação contínua em pedaços secundários
     processo_ffmpeg = iniciar_buffer_circular()
 
     try:
@@ -292,7 +315,7 @@ if autenticar_e_ativar_totem():
             time.sleep(0.1)
 
     finally:
-        if 'processo_ffmpeg' in locals():
+        if 'processo_ffmpeg' in locals() and processo_ffmpeg:
             if os.name == 'nt':
                 subprocess.run(f"taskkill /F /T /PID {processo_ffmpeg.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
