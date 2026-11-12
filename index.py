@@ -26,6 +26,7 @@ TEMPO_SEGMENTO = int(os.getenv("TEMPO_SEGMENTO", "5"))
 TRAVA_TEMPO_SEGUNDOS = int(os.getenv("TRAVA_TEMPO_SEGUNDOS", "20"))
 RETENCAO_LOCAL_HORAS = int(os.getenv("RETENCAO_LOCAL_HORAS", "24"))
 PINO_BOTAO_GPIO = int(os.getenv("PINO_BOTAO_GPIO", "17"))
+PINO_FEEDBACK_GPIO = int(os.getenv("PINO_FEEDBACK_GPIO", "27")) # Pino Físico 13 (Buzzer/LED)
 
 # Otimização de diretórios por SO
 pasta_seg_env = os.getenv("PASTA_SEGMENTOS", "./segmentos")
@@ -51,7 +52,21 @@ ultimo_clique_timestamp = 0
 trava_lock = threading.Lock()
 fila_tarefas = queue.Queue()
 processo_ffmpeg = None
+feedback_dispositivo = None
 executando = True
+
+def acionar_feedback_confirmacao(duracao=1.0):
+    """Aciona bip/LED de confirmação para os atletas saberem que o lance foi gravado."""
+    global feedback_dispositivo
+    if feedback_dispositivo:
+        def _acionar():
+            try:
+                feedback_dispositivo.on()
+                time.sleep(duracao)
+                feedback_dispositivo.off()
+            except Exception:
+                pass
+        threading.Thread(target=_acionar, daemon=True).start()
 
 print("=" * 65)
 print("🦊 FOX REPLAY — TOTEM EDGE CORE (ALTA DISPONIBILIDADE)")
@@ -200,6 +215,7 @@ def registrar_lance_solicitado():
 
     timestamp_id = int(tempo_atual)
     print(f"\n🔘 [BOTÃO ACIONADO] Lance {timestamp_id} agendado para processamento!")
+    acionar_feedback_confirmacao(1.2)
 
     tarefa = {
         "id": timestamp_id,
@@ -376,12 +392,21 @@ def limpar_arquivos_antigos():
 # LISTENERS DE BOTÃO (DUAL INPUT: GPIO OU TECLADO)
 # ==============================================================================
 def iniciar_listener_gpio():
-    """Inicia listener para o botão industrial nos pinos GPIO do Raspberry Pi."""
+    """Inicia listener para o botão (com ou sem fio) e feedback de confirmação (Buzzer/LED)."""
+    global feedback_dispositivo
     try:
-        from gpiozero import Button
+        from gpiozero import Button, OutputDevice
+
+        # Inicia feedback (Buzzer/LED) para cenários sem totem/tela
+        try:
+            feedback_dispositivo = OutputDevice(PINO_FEEDBACK_GPIO, active_high=True, initial_value=False)
+            print(f"🔊 [FEEDBACK] Buzzer/LED ativo no pino GPIO {PINO_FEEDBACK_GPIO} (Pino Físico 13).")
+        except Exception as ef:
+            print(f"ℹ️  [FEEDBACK] Buzzer/LED opcional não conectado ({ef}).")
+
         botao = Button(PINO_BOTAO_GPIO, bounce_time=0.2)
         botao.when_pressed = registrar_lance_solicitado
-        print(f"🔌 [GPIO] Botão físico monitorado no pino GPIO {PINO_BOTAO_GPIO} (Pino 11).")
+        print(f"🔌 [GPIO] Botão físico/wireless monitorado no pino GPIO {PINO_BOTAO_GPIO} (Pino 11).")
         return True
     except Exception as e:
         print(f"ℹ️  [GPIO Não Detectado] ({e}). Utilizando listener de teclado para testes.")
