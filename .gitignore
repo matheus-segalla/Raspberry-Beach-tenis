@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+queue.json
+qr_replay_atual.png
+segmentos/
+replays/
+lista_*.txt
+.env
+.env.local
+.env*.local

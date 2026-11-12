@@ -1,221 +1,289 @@
 import os
+import sys
 import subprocess
 import time
 import json
-import requests  # Biblioteca oficial de requisições HTTP
+import threading
+import queue
+import glob
+import requests
 from dotenv import load_dotenv
-import keyboard
-import qrcode  
 
-# Carrega as variáveis do arquivo .env local
+# Carrega variáveis de ambiente
 load_dotenv()
 
-# Configurações essenciais do ecossistema vinda do .env
+# ==============================================================================
+# CONFIGURAÇÕES ESSENCIAIS
+# ==============================================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-TOKEN_DISPOSITIVO = os.getenv("TOKEN_DISPOSITIVO") # Chave mestra de ativação da quadra
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000") # Link oficial do app (Vercel ou local)
+TOKEN_DISPOSITIVO = os.getenv("TOKEN_DISPOSITIVO")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://fox-replay.vercel.app").rstrip("/")
 
 ARQUIVO_FILA = "queue.json"
-TRAVA_TEMPO_SEGUNDOS = 15  
-ultimo_clique_timestamp = 0
+TRAVA_TEMPO_SEGUNDOS = int(os.getenv("TRAVA_TEMPO_SEGUNDOS", "15"))
+RETENCAO_LOCAL_HORAS = int(os.getenv("RETENCAO_LOCAL_HORAS", "24"))
+PINO_BOTAO_GPIO = int(os.getenv("PINO_BOTAO_GPIO", "17"))
 
-# Variável global que será preenchida dinamicamente via API no boot do sistema
+# Otimização de diretórios por SO
+pasta_seg_env = os.getenv("PASTA_SEGMENTOS", "./segmentos")
+if os.name == 'nt' and pasta_seg_env.startswith('/tmp'):
+    PASTA_SEGMENTOS = "./segmentos"
+else:
+    PASTA_SEGMENTOS = pasta_seg_env
+
+PASTA_REPLAYS = os.getenv("PASTA_REPLAYS", "./replays")
+
+os.makedirs(PASTA_SEGMENTOS, exist_ok=True)
+os.makedirs(PASTA_REPLAYS, exist_ok=True)
+
+# Binário FFmpeg
+if os.name == 'nt':
+    FFMPEG_EXEC = 'ffmpeg.exe' if os.path.exists('ffmpeg.exe') else 'ffmpeg'
+else:
+    FFMPEG_EXEC = 'ffmpeg'
+
+# Variáveis de controle de concorrência e estado
 QUADRA_ID = None
+ultimo_clique_timestamp = 0
+trava_lock = threading.Lock()
+fila_tarefas = queue.Queue()
+processo_ffmpeg = None
+executando = True
 
-# 🚀 DEFINE O EXECUTÁVEL CORRETO DO FFMPEG BASEADO NO SISTEMA OPERACIONAL
-FFMPEG_EXEC = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+print("=" * 65)
+print("🦊 FOX REPLAY — TOTEM EDGE CORE (ALTA DISPONIBILIDADE)")
+print("=" * 65)
 
-# 🚀 CRIA AS PASTAS AUTOMATICAMENTE SE ELAS NÃO EXISTIREM NO RASPBERRY
-os.makedirs(os.getenv('PASTA_SEGMENTOS', './segmentos'), exist_ok=True)
-os.makedirs(os.getenv('PASTA_REPLAYS', './replays'), exist_ok=True)
-
-print("=== SISTEMA DE REPLAY VIA HTTP — TOQUE EXCLUSIVO DE ELITE ===")
-
+# ==============================================================================
+# AUTENTICAÇÃO E ATIVAÇÃO DINÂMICA
+# ==============================================================================
 def autenticar_e_ativar_totem():
-    """Bate na tabela dispositivos do Supabase e descobre o ID da quadra dinamicamente usando o Token."""
+    """Conecta ao Supabase e obtém dinamicamente o ID da quadra através do Token seguro."""
     global QUADRA_ID
-    print("🔑 Autenticando dispositivo nos servidores FOX REPLAY...")
+    print("🔑 Autenticando Totem nos servidores Fox Replay...")
     
     if not TOKEN_DISPOSITIVO:
-        print("❌ CRÍTICO: TOKEN_DISPOSITIVO não configurado no arquivo .env!")
+        print("❌ CRÍTICO: TOKEN_DISPOSITIVO não configurado no .env!")
         return False
 
-    # Endpoint rest do Supabase para filtrar pelo token secreto gerado na dashboard
-    endpoint = f"{SUPABASE_URL}/rest/v1/dispositivos?token_autenticacao=eq.{TOKEN_DISPOSITIVO}&select=quadra_id"
     headers = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/json"
     }
 
+    # 1. Tenta primeiro a RPC segura (validar_totem) que não vaza a tabela
+    endpoint_rpc = f"{SUPABASE_URL}/rest/v1/rpc/validar_totem"
     try:
-        resposta = requests.get(endpoint, headers=headers)
+        resposta_rpc = requests.post(endpoint_rpc, headers=headers, json={"p_token": TOKEN_DISPOSITIVO}, timeout=10)
+        if resposta_rpc.status_code == 200:
+            dados_rpc = resposta_rpc.json()
+            if dados_rpc.get('valido') and dados_rpc.get('quadra_id'):
+                QUADRA_ID = dados_rpc['quadra_id']
+                print("✅ TOTEM ATIVADO COM SUCESSO VIA RPC SEGURA!")
+                print(f"📌 Quadra ID Vinculada: {QUADRA_ID}\n")
+                return True
+            else:
+                print("❌ ERRO: Token do Totem inválido ou não cadastrado no painel!")
+                return False
+    except Exception as e:
+        print(f"⚠️ Aviso na RPC segura ({e}). Tentando endpoint de compatibilidade...")
+
+    # 2. Fallback de compatibilidade (query direta) caso o script SQL ainda não tenha sido rodado
+    endpoint = f"{SUPABASE_URL}/rest/v1/dispositivos?token_autenticacao=eq.{TOKEN_DISPOSITIVO}&select=quadra_id"
+    try:
+        resposta = requests.get(endpoint, headers=headers, timeout=10)
         if resposta.status_code == 200:
             dados = resposta.json()
             if dados and len(dados) > 0:
                 QUADRA_ID = dados[0]['quadra_id']
-                print(f"✅ CONEXÃO ESTABELECIDA COM SUCESSO!")
-                print(f"📌 ID da Quadra Ativado em Memória: {QUADRA_ID}\n")
+                print("✅ TOTEM ATIVADO COM SUCESSO!")
+                print(f"📌 Quadra ID Vinculada: {QUADRA_ID}\n")
                 return True
             else:
-                print("❌ ERRO: Token do Totem inválido ou não encontrado no painel!")
+                print("❌ ERRO: Token do Totem inválido ou não cadastrado no painel!")
                 return False
         else:
-            print(f"❌ ERRO DE CONEXÃO COM O BANCO: {resposta.status_code}")
+            print(f"❌ ERRO HTTP BANCO: {resposta.status_code}")
             return False
     except Exception as e:
-        print(f"❌ FALHA SÉRIA DE REDE AO AUTENTICAR: {e}")
+        print(f"❌ FALHA DE REDE AO AUTENTICAR: {e}")
         return False
 
+# ==============================================================================
+# WATCHDOG & BUFFER CIRCULAR DO FFMPEG
+# ==============================================================================
 def iniciar_buffer_circular():
-    """Inicia o FFmpeg adaptando-se inteligentemente para Câmeras IP (RTSP) ou USB."""
+    """Inicia o processo FFmpeg em modo contínuo de buffer circular."""
+    global processo_ffmpeg
     camera_input = os.getenv('CAMERA_NOME', 'rtsp://admin:SuaSenhaAqui@XXXX:554/Streaming/Channels/101')
-    pasta_seg = os.getenv('PASTA_SEGMENTOS', './segmentos')
     tempo_seg = os.getenv('TEMPO_SEGMENTO', '5')
     qtd_seg = os.getenv('QUANTIDADE_SEGMENTOS', '12')
 
-    # 🌐 SE FOR UMA CÂMERA IP (HIKVISION / RTSP)
     if camera_input.startswith('rtsp://'):
-        print(f"📡 [REDE] Conectando ao fluxo de vídeo da Câmera IP Hikvision...")
-        print(f"🔗 URL Alvo: {camera_input}")
-        
+        print(f"📡 [CÂMERA IP] Conectando ao fluxo RTSP: {camera_input}")
         comando = [
             FFMPEG_EXEC,
-            '-rtsp_transport', 'tcp',  # Força conexão estável via TCP sem perda de pacotes
+            '-rtsp_transport', 'tcp',
             '-i', camera_input,
-            '-c:v', 'copy',            # ⚡ MÁGICA: Copia o H.264 bruto da Hikvision. O uso de CPU no Pi 3B cai para ~2%
+            '-c:v', 'copy',
             '-f', 'segment',
             '-segment_time', tempo_seg,
             '-segment_wrap', qtd_seg,
             '-reset_timestamps', '1',
             '-y',
-            f"{pasta_seg}/video_%03d.mp4"
+            f"{PASTA_SEGMENTOS}/video_%03d.mp4"
         ]
-        return subprocess.Popen(comando, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 🔌 SE FOR WEBCAM USB COMUM (LOGITECH, ETC)
     else:
-        print(f"🔌 [USB] Conectando à Webcam USB nativa...")
+        print(f"🔌 [WEBCAM USB] Conectando à câmera: {camera_input}")
         resolucao = os.getenv('RESOLUCAO', '1280x720')
         fps = os.getenv('FPS', '30')
-
-        if os.name == 'nt':  # Windows
+        if os.name == 'nt':
             cmd_input = ['-f', 'dshow', '-i', f"video={camera_input}"]
-        else:  # 🍓 Raspberry Pi / Linux
+        else:
             cmd_input = ['-f', 'v4l2', '-i', camera_input]
 
         comando = [
             FFMPEG_EXEC, *cmd_input,
             '-s', resolucao, '-r', fps,
-            '-c:v', 'libx264', '-f', 'segment',
+            '-c:v', 'libx264',
+            '-f', 'segment',
             '-segment_time', tempo_seg,
             '-segment_wrap', qtd_seg,
-            '-reset_timestamps', '1', '-y',
-            f"{pasta_seg}/video_%03d.mp4"
+            '-reset_timestamps', '1',
+            '-y',
+            f"{PASTA_SEGMENTOS}/video_%03d.mp4"
         ]
-        return subprocess.Popen(comando, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def adicionar_a_fila():
-    """Adiciona um novo pedido de replay no arquivo queue.json."""
+    try:
+        processo_ffmpeg = subprocess.Popen(
+            comando,
+            shell=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return processo_ffmpeg
+    except Exception as e:
+        print(f"❌ Falha ao iniciar FFmpeg: {e}")
+        return None
+
+def supervisor_ffmpeg():
+    """Watchdog que monitora o processo FFmpeg e reinicia automaticamente se cair."""
+    global processo_ffmpeg, executando
+    while executando:
+        time.sleep(5)
+        if processo_ffmpeg is not None:
+            ret = processo_ffmpeg.poll()
+            if ret is not None:
+                print(f"⚠️ [WATCHDOG] O processo do FFmpeg parou com código {ret}! Reiniciando em 2s...")
+                time.sleep(2)
+                iniciar_buffer_circular()
+
+# ==============================================================================
+# FILA DE TAREFAS PERSISTENTE E ANTI-SPAM
+# ==============================================================================
+def registrar_lance_solicitado():
+    """Registra uma solicitação de replay de forma não-bloqueante."""
     global ultimo_clique_timestamp
     tempo_atual = time.time()
 
-    if tempo_atual - ultimo_clique_timestamp < TRAVA_TEMPO_SEGUNDOS:
-        tempo_restante = int(TRAVA_TEMPO_SEGUNDOS - (tempo_atual - ultimo_clique_timestamp))
-        print(f"⚠️ [TRAVA] Botão bloqueado! Aguarde mais {tempo_restante}s.")
-        return
+    with trava_lock:
+        if tempo_atual - ultimo_clique_timestamp < TRAVA_TEMPO_SEGUNDOS:
+            restante = int(TRAVA_TEMPO_SEGUNDOS - (tempo_atual - ultimo_clique_timestamp))
+            print(f"⚠️ [TRAVA] Botão em cooldown! Aguarde mais {restante}s.")
+            return False
 
-    ultimo_clique_timestamp = tempo_atual
+        ultimo_clique_timestamp = tempo_atual
+
     timestamp_id = int(tempo_atual)
-    print(f"\n🔘 [BOTÃO] Clique registrado! Adicionando lance {timestamp_id} à fila...")
+    print(f"\n🔘 [BOTÃO ACIONADO] Lance {timestamp_id} agendado para processamento!")
 
-    fila = []
-    if os.path.exists(ARQUIVO_FILA):
-        try:
-            with open(ARQUIVO_FILA, "r") as f: fila = json.load(f)
-        except json.JSONDecodeError: fila = []
-
-    nova_tarefa = {
+    tarefa = {
         "id": timestamp_id,
         "status_video": "pendente",
         "status_upload": "pendente",
         "caminho_arquivo": "",
         "criado_em": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(tempo_atual))
     }
-    fila.append(nova_tarefa)
 
-    with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
-
-def processar_fila_de_replays():
-    """Busca tarefas pendentes e costura os vídeos locally."""
-    if not os.path.exists(ARQUIVO_FILA): return
-
+    # Persiste na fila JSON para tolerância a falhas
     try:
-        with open(ARQUIVO_FILA, "r") as f: fila = json.load(f)
-    except (json.JSONDecodeError, PermissionError): return
-
-    tarefas_pendentes = [t for t in fila if t["status_video"] == "pendente"]
-    if not tarefas_pendentes: return
-
-    tarefa = tarefas_pendentes[0]
-    tarefa["status_video"] = "processando"
-    with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
-
-    pasta_seg = os.getenv('PASTA_SEGMENTOS', './segmentos')
-    arquivo_final = f"{os.getenv('PASTA_REPLAYS', './replays')}/replay_{tarefa['id']}.mp4"
-    lista_txt_path = f"lista_{tarefa['id']}.txt"
-
-    try:
-        arquivos = [f for f in os.listdir(pasta_seg) if f.endswith('.mp4')]
-        if len(arquivos) >= 3:
-            arquivos_ordenados = sorted(arquivos, key=lambda x: os.path.getmtime(os.path.join(pasta_seg, x)))
-            ultimos_segmentos = arquivos_ordenados[-8:-1] if len(arquivos_ordenados) >= 8 else arquivos_ordenados[:-1]
-
-            with open(lista_txt_path, "w") as f:
-                for seg in ultimos_segmentos:
-                    f.write(f"file '{os.path.join(pasta_seg, seg).replace('\\', '/')}'\n")
-
-            comando_concat = [FFMPEG_EXEC, '-f', 'concat', '-safe', '0', '-i', lista_txt_path, '-c', 'copy', '-y', arquivo_final]
-            subprocess.run(comando_concat, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            if os.path.exists(lista_txt_path): os.remove(lista_txt_path)
-
-            print(f"🎉 [VÍDEO] Replay {tarefa['id']} costurado com sucesso!")
-            tarefa["status_video"] = "concluido"
-            tarefa["caminho_arquivo"] = arquivo_final
-        else:
-            print("[AVISO] Poucos segmentos para gerar o vídeo. Cancelando tarefa.")
-            tarefa["status_video"] = "erro_pouco_segmento"
-
+        fila = []
+        if os.path.exists(ARQUIVO_FILA):
+            with open(ARQUIVO_FILA, "r") as f:
+                fila = json.load(f)
+        fila.append(tarefa)
+        with open(ARQUIVO_FILA, "w") as f:
+            json.dump(fila, f, indent=4)
     except Exception as e:
-        print(f"[ERRO] Falha ao gerar vídeo {tarefa['id']}: {e}")
-        return
+        print(f"Erro ao salvar fila JSON: {e}")
 
-    with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
+    fila_tarefas.put(tarefa)
+    return True
 
-def executar_upload_da_fila():
-    """Pega os vídeos concluídos, faz o upload para o Storage e registra na tabela do banco."""
-    global QUADRA_ID
-    if not os.path.exists(ARQUIVO_FILA): return
+# ==============================================================================
+# WORKER EM BACKGROUND: COSTURA DE VÍDEO + UPLOAD NUVEM + QR CODE
+# ==============================================================================
+def worker_processamento():
+    """Worker assíncrono que costura o vídeo e envia para a nuvem sem travar o botão."""
+    global executando, QUADRA_ID
 
-    try:
-        with open(ARQUIVO_FILA, "r") as f: fila = json.load(f)
-    except (json.JSONDecodeError, PermissionError): return
+    while executando:
+        try:
+            tarefa = fila_tarefas.get(timeout=1)
+        except queue.Empty:
+            continue
 
-    tarefas_para_upload = [t for t in fila if t["status_video"] == "concluido" and t["status_upload"] in ["pendente", "erro_rede"]]
-    if not tarefas_para_upload: return
+        tarefa_id = tarefa["id"]
+        print(f"\n⚙️  [WORKER] Iniciando processamento do lance {tarefa_id}...")
 
-    tarefa = tarefas_para_upload[0]
-    tarefa["status_upload"] = "enviando"
-    with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
+        # 1. Costura dos Segmentos
+        arquivo_final = f"{PASTA_REPLAYS}/replay_{tarefa_id}.mp4"
+        lista_txt_path = f"lista_{tarefa_id}.txt"
 
-    print(f"☁️  [NUVEM] Iniciando upload via HTTP do replay_{tarefa['id']}.mp4...")
+        sucesso_video = False
+        try:
+            arquivos = [f for f in os.listdir(PASTA_SEGMENTOS) if f.endswith('.mp4')]
+            if len(arquivos) >= 3:
+                arquivos_ordenados = sorted(
+                    arquivos,
+                    key=lambda x: os.path.getmtime(os.path.join(PASTA_SEGMENTOS, x))
+                )
+                ultimos_segmentos = arquivos_ordenados[-8:-1] if len(arquivos_ordenados) >= 8 else arquivos_ordenados[:-1]
 
-    try:
-        nome_arquivo_nuvem = f"replay_{tarefa['id']}.mp4"
-        
-        # 1. FAZ O UPLOAD DO VÍDEO PARA O STORAGE
+                with open(lista_txt_path, "w") as f:
+                    for seg in ultimos_segmentos:
+                        caminho_limpo = os.path.join(PASTA_SEGMENTOS, seg).replace('\\', '/')
+                        f.write(f"file '{caminho_limpo}'\n")
+
+                comando_concat = [
+                    FFMPEG_EXEC, '-f', 'concat', '-safe', '0',
+                    '-i', lista_txt_path, '-c', 'copy', '-y', arquivo_final
+                ]
+                subprocess.run(comando_concat, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                if os.path.exists(lista_txt_path):
+                    os.remove(lista_txt_path)
+
+                if os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 1000:
+                    sucesso_video = True
+                    tarefa["caminho_arquivo"] = arquivo_final
+                    print(f"🎉 [VÍDEO] Replay {tarefa_id} costurado com sucesso!")
+                else:
+                    print(f"❌ [ERRO] Arquivo final {arquivo_final} não foi gerado corretamente.")
+            else:
+                print("⚠️ [AVISO] Poucos segmentos disponíveis no buffer. Aguarde acumular vídeo.")
+        except Exception as e:
+            print(f"❌ [ERRO] Falha ao costurar vídeo {tarefa_id}: {e}")
+
+        if not sucesso_video:
+            fila_tarefas.task_done()
+            continue
+
+        # 2. Upload para o Supabase Storage
+        print(f"☁️  [NUVEM] Enviando replay_{tarefa_id}.mp4 para o Storage...")
+        nome_arquivo_nuvem = f"replay_{tarefa_id}.mp4"
         endpoint_storage = f"{SUPABASE_URL}/storage/v1/object/replays/{nome_arquivo_nuvem}"
         headers_storage = {
             "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -223,105 +291,226 @@ def executar_upload_da_fila():
             "Content-Type": "video/mp4"
         }
 
-        with open(tarefa["caminho_arquivo"], "rb") as f_video:
-            resposta_storage = requests.post(endpoint_storage, headers=headers_storage, data=f_video)
-        
-        if resposta_storage.status_code == 200:
-            print("💾 [STORAGE] Arquivo saved no bucket com sucesso!")
-            
-            # URL pública definitiva do vídeo mp4
-            url_publica_video = f"{SUPABASE_URL}/storage/v1/object/public/replays/{nome_arquivo_nuvem}"
-            
-            # 2. INSERE O REGISTRO USANDO O ID RESOLVIDO DINAMICAMENTE
-            print("📝 [BANCO DE DADOS] Registrando jogada na tabela...")
-            endpoint_banco = f"{SUPABASE_URL}/rest/v1/replays"
-            
-            headers_banco = {
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "apikey": SUPABASE_KEY,
-                "Content-Type": "application/json",
-                "Prefer": "return=representation"
-            }
-            
-            payload_banco = {
-                "quadra_id": QUADRA_ID, 
-                "video_url": url_publica_video
-            }
-            
-            resposta_banco = requests.post(endpoint_banco, headers=headers_banco, json=payload_banco)
-            
-            if resposta_banco.status_code == 201:
-                dados_replay_criado = resposta_banco.json()
-                id_do_replay = dados_replay_criado[0]['id']
-                
-                # Link montado dinamicamente com base na URL do seu front da Vercel ou Local
-                link_front_jogador = f"{FRONTEND_URL}/jogada?id={id_do_replay}"
-                
-                print(f"🚀 [SUCESSO TOTAL] Replay disponível na nuvem!")
-                print(f"👉 Link do Jogador: {link_front_jogador}\n")
-                
-                # GERAÇÃO DO QR CODE
-                print("🖼️  [QR CODE] Gerando imagem direcionada ao app...")
-                qr = qrcode.QRCode(version=1, box_size=10, border=5)
-                qr.add_data(link_front_jogador)
-                qr.make(fit=True)
-                
-                img_qr = qr.make_image(fill_color="black", back_color="white")
-                caminho_qr = "qr_replay_atual.png"
-                img_qr.save(caminho_qr)
-                
-                if os.name == 'nt':
-                    os.startfile(caminho_qr)
+        try:
+            with open(arquivo_final, "rb") as f_video:
+                resposta_storage = requests.post(endpoint_storage, headers=headers_storage, data=f_video, timeout=60)
+
+            if resposta_storage.status_code in [200, 201]:
+                print("💾 [STORAGE] Arquivo salvo no bucket com sucesso!")
+                url_publica_video = f"{SUPABASE_URL}/storage/v1/object/public/replays/{nome_arquivo_nuvem}"
+
+                # 3. Inserção no Banco de Dados
+                print("📝 [BANCO] Registrando jogada na tabela...")
+                endpoint_banco = f"{SUPABASE_URL}/rest/v1/replays"
+                headers_banco = {
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "apikey": SUPABASE_KEY,
+                    "Content-Type": "application/json",
+                    "Prefer": "return=representation"
+                }
+                payload_banco = {
+                    "quadra_id": QUADRA_ID,
+                    "video_url": url_publica_video
+                }
+
+                resposta_banco = requests.post(endpoint_banco, headers=headers_banco, json=payload_banco, timeout=15)
+                if resposta_banco.status_code in [200, 201]:
+                    dados_replay = resposta_banco.json()
+                    id_do_replay = dados_replay[0]['id']
+                    link_front = f"{FRONTEND_URL}/jogada?id={id_do_replay}"
+
+                    print(f"🚀 [SUCESSO TOTAL] Replay liberado!")
+                    print(f"👉 Link do Jogador: {link_front}")
+
+                    # 4. Geração de QR Code
+                    gerar_e_exibir_qr(link_front)
                 else:
-                    subprocess.Popen(['xdg-open', caminho_qr])
-                
-                print("📺 [QR CODE] Exibido na tela com sucesso!\n")
-                fila = [t for t in fila if t["id"] != tarefa["id"]]
+                    print(f"❌ [ERRO BANCO] Falha ao registrar na tabela: {resposta_banco.status_code}")
             else:
-                print(f"❌ [ERRO BANCO] Falha ao registrar na tabela: {resposta_banco.status_code}")
-                tarefa["status_upload"] = "erro_rede"
-        else:
-            print(f"❌ [ERRO STORAGE] Falha no upload do arquivo: {resposta_storage.status_code}")
-            tarefa["status_upload"] = "erro_rede"
+                print(f"❌ [ERRO STORAGE] Código HTTP: {resposta_storage.status_code}")
+        except Exception as e:
+            print(f"📡 [REDE] Erro durante o upload: {e}")
 
+        # 5. Limpeza de Disco (Retenção de Arquivos)
+        limpar_arquivos_antigos()
+        fila_tarefas.task_done()
+
+def gerar_e_exibir_qr(link):
+    """Gera o QR Code com a biblioteca qrcode."""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        qr.add_data(link)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        caminho_qr = "qr_replay_atual.png"
+        img.save(caminho_qr)
+        print("🖼️  [QR CODE] Gerado com sucesso: qr_replay_atual.png\n")
     except Exception as e:
-        print(f"📡 [REDE] Erro crítico no processo: {e}")
-        # 🛠️ CORRIGIDO: Era 'farefa', mudado para 'tarefa'
-        tarefa["status_upload"] = "erro_rede"
+        print(f"Erro ao gerar QR Code: {e}")
 
-    with open(ARQUIVO_FILA, "w") as f: json.dump(fila, f, indent=4)
+def limpar_arquivos_antigos():
+    """Remove vídeos locais mais velhos que o limite estipulado para proteger o cartão SD."""
+    try:
+        limite_segundos = RETENCAO_LOCAL_HORAS * 3600
+        agora = time.time()
+        for arquivo in glob.glob(f"{PASTA_REPLAYS}/*.mp4"):
+            if agora - os.path.getmtime(arquivo) > limite_segundos:
+                os.remove(arquivo)
+                print(f"🧹 [LIMPEZA] Removido clipe antigo expirado: {os.path.basename(arquivo)}")
+    except Exception as e:
+        print(f"Aviso de limpeza: {e}")
 
 # ==============================================================================
-# FLUXO PRINCIPAL DE INICIALIZAÇÃO (BOOT)
+# LISTENERS DE BOTÃO (DUAL INPUT: GPIO OU TECLADO)
 # ==============================================================================
-if autenticar_e_ativar_totem():
-    print("Pressione [ESPAÇO] para salvar uma jogada. Pressione [ESC] para sair.\n")
-    
-    processo_ffmpeg = iniciar_buffer_circular()
+def iniciar_listener_gpio():
+    """Inicia listener para o botão industrial nos pinos GPIO do Raspberry Pi."""
+    try:
+        from gpiozero import Button
+        botao = Button(PINO_BOTAO_GPIO, bounce_time=0.2)
+        botao.when_pressed = registrar_lance_solicitado
+        print(f"🔌 [GPIO] Botão físico monitorado no pino GPIO {PINO_BOTAO_GPIO} (Pino 11).")
+        return True
+    except Exception as e:
+        print(f"ℹ️  [GPIO Não Detectado] ({e}). Utilizando listener de teclado para testes.")
+        return False
+
+# ==============================================================================
+# PAREAMENTO AUTOMÁTICO (ZERO-TOUCH VIA CÓDIGO DE 6 DÍGITOS)
+# ==============================================================================
+def salvar_token_no_env(token):
+    """Grava o novo token recebido no arquivo .env para persistência nos próximos boots."""
+    try:
+        linhas = []
+        if os.path.exists('.env'):
+            with open('.env', 'r', encoding='utf-8') as f:
+                linhas = f.readlines()
+
+        token_atualizado = False
+        novas_linhas = []
+        for l in linhas:
+            if l.startswith("TOKEN_DISPOSITIVO="):
+                novas_linhas.append(f"TOKEN_DISPOSITIVO={token}\n")
+                token_atualizado = True
+            else:
+                novas_linhas.append(l)
+
+        if not token_atualizado:
+            novas_linhas.append(f"\nTOKEN_DISPOSITIVO={token}\n")
+
+        with open('.env', 'w', encoding='utf-8') as f:
+            f.writelines(novas_linhas)
+        print("💾 Token gravado com sucesso no arquivo .env local!")
+    except Exception as e:
+        print(f"Aviso ao salvar .env: {e}")
+
+def iniciar_modo_pareamento():
+    """Gera código de 6 dígitos estilo Smart TV e aguarda ativação pelo celular."""
+    import random
+    codigo = f"{random.randint(100, 999)}-{random.randint(100, 999)}"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+    endpoint_pareamento = f"{SUPABASE_URL}/rest/v1/pareamentos"
+    payload = {"codigo": codigo, "status": "pendente"}
 
     try:
+        requests.post(endpoint_pareamento, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erro ao registrar pareamento no banco: {e}")
+
+    print("\n" + "=" * 65)
+    print("🦊 FOX REPLAY — PAREAMENTO RÁPIDO DO TOTEM")
+    print("=" * 65)
+    print("  Totem ligado e pronto para ativação sem complicação!\n")
+    print(f"  👉 CÓDIGO DE ATIVAÇÃO:    [  {codigo}  ]\n")
+    print(f"  👉 Acesse no celular: {FRONTEND_URL}/dashboard")
+    print("     Clique em 'Vincular Totem por Código' e digite os dígitos acima.")
+    print("=" * 65)
+    print("  Aguardando ativação pelo celular...")
+
+    # Salva QR Code com link direto para agilizar ainda mais
+    try:
+        import qrcode
+        qr = qrcode.QRCode(version=1, box_size=8, border=3)
+        qr.add_data(f"{FRONTEND_URL}/ativar?codigo={codigo}")
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        img.save("qr_pareamento.png")
+    except Exception:
+        pass
+
+    # Loop de escuta do pareamento
+    while True:
+        time.sleep(3)
+        try:
+            url_check = f"{SUPABASE_URL}/rest/v1/pareamentos?codigo=eq.{codigo}&select=status,token_gerado,quadra_id"
+            r = requests.get(url_check, headers=headers, timeout=6)
+            if r.status_code == 200:
+                dados = r.json()
+                if dados and len(dados) > 0 and dados[0].get("status") == "vinculado":
+                    token = dados[0].get("token_gerado")
+                    quadra_id = dados[0].get("quadra_id")
+                    if token and quadra_id:
+                        print(f"\n🎉 [SUCESSO TOTAL] Totem pareado e vinculado à quadra {quadra_id}!")
+                        salvar_token_no_env(token)
+                        return token, quadra_id
+        except Exception:
+            pass
+
+# ==============================================================================
+# FLUXO DE EXECUÇÃO PRINCIPAL
+# ==============================================================================
+if __name__ == "__main__":
+    if not autenticar_e_ativar_totem():
+        print("⚠️ Totem não vinculado. Entrando no modo de pareamento automático...")
+        token_novo, quadra_id_nova = iniciar_modo_pareamento()
+        TOKEN_DISPOSITIVO = token_novo
+        QUADRA_ID = quadra_id_nova
+
+    # Inicia buffer de vídeo
+    iniciar_buffer_circular()
+
+    # Inicia Watchdog de vídeo
+    thread_watchdog = threading.Thread(target=supervisor_ffmpeg, daemon=True)
+    thread_watchdog.start()
+
+    # Inicia Worker de processamento e upload
+    thread_worker = threading.Thread(target=worker_processamento, daemon=True)
+    thread_worker.start()
+
+    # Inicia Listener GPIO se disponível
+    gpio_ativo = iniciar_listener_gpio()
+
+    print("\n🟢 SISTEMA PRONTO E MONITORANDO!")
+    print("👉 Pressione [ESPAÇO] no teclado ou o botão físico na quadra para salvar um lance.")
+    print("👉 Pressione [Ctrl + C] para finalizar.\n")
+
+    try:
+        # Loop do teclado / supervisor principal
+        import keyboard
         while True:
-            if keyboard.is_pressed('space'):
-                adicionar_a_fila()
-                time.sleep(0.3)
-                
-            processar_fila_de_replays()  
-            executar_upload_da_fila()    
-
-            if keyboard.is_pressed('esc'):
-                print("\nEncerrando o sistema de forma limpa...")
-                break
-                
-            time.sleep(0.1)
-
+            try:
+                if keyboard.is_pressed('space'):
+                    registrar_lance_solicitado()
+                    time.sleep(0.3)
+            except Exception:
+                # Caso rode no Linux sem privilégios de root para teclado
+                pass
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\nFinalizando o Fox Replay Totem...")
     finally:
-        if 'processo_ffmpeg' in locals() and processo_ffmpeg:
+        executando = False
+        if processo_ffmpeg:
             if os.name == 'nt':
                 subprocess.run(f"taskkill /F /T /PID {processo_ffmpeg.pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 processo_ffmpeg.terminate()
-                
-        if os.path.exists(ARQUIVO_FILA): os.remove(ARQUIVO_FILA)
-        print("Sistema finalizado.")
-else:
-    print("❌ BOOT ABORTADO: Não foi possível sincronizar o Totem com os servidores.")
+        print("Totem finalizado com sucesso.")
