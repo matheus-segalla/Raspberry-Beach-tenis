@@ -21,7 +21,9 @@ TOKEN_DISPOSITIVO = os.getenv("TOKEN_DISPOSITIVO")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://fox-replay.vercel.app").rstrip("/")
 
 ARQUIVO_FILA = "queue.json"
-TRAVA_TEMPO_SEGUNDOS = int(os.getenv("TRAVA_TEMPO_SEGUNDOS", "15"))
+SEGUNDOS_REPLAY = int(os.getenv("SEGUNDOS_REPLAY", "30"))
+TEMPO_SEGMENTO = int(os.getenv("TEMPO_SEGMENTO", "5"))
+TRAVA_TEMPO_SEGUNDOS = int(os.getenv("TRAVA_TEMPO_SEGUNDOS", "20"))
 RETENCAO_LOCAL_HORAS = int(os.getenv("RETENCAO_LOCAL_HORAS", "24"))
 PINO_BOTAO_GPIO = int(os.getenv("PINO_BOTAO_GPIO", "17"))
 
@@ -118,8 +120,8 @@ def iniciar_buffer_circular():
     """Inicia o processo FFmpeg em modo contínuo de buffer circular."""
     global processo_ffmpeg
     camera_input = os.getenv('CAMERA_NOME', 'rtsp://admin:SuaSenhaAqui@XXXX:554/Streaming/Channels/101')
-    tempo_seg = os.getenv('TEMPO_SEGMENTO', '5')
-    qtd_seg = os.getenv('QUANTIDADE_SEGMENTOS', '12')
+    tempo_seg = str(TEMPO_SEGMENTO)
+    qtd_seg = os.getenv('QUANTIDADE_SEGMENTOS', '14')
 
     if camera_input.startswith('rtsp://'):
         print(f"📡 [CÂMERA IP] Conectando ao fluxo RTSP: {camera_input}")
@@ -238,19 +240,28 @@ def worker_processamento():
         tarefa_id = tarefa["id"]
         print(f"\n⚙️  [WORKER] Iniciando processamento do lance {tarefa_id}...")
 
-        # 1. Costura dos Segmentos
+        # 1. Costura dos Segmentos (Gera os últimos 30 segundos)
         arquivo_final = f"{PASTA_REPLAYS}/replay_{tarefa_id}.mp4"
         lista_txt_path = f"lista_{tarefa_id}.txt"
 
         sucesso_video = False
         try:
             arquivos = [f for f in os.listdir(PASTA_SEGMENTOS) if f.endswith('.mp4')]
-            if len(arquivos) >= 3:
+            # Quantidade de segmentos necessários para fechar os segundos de replay solicitados (ex: 30s / 5s = 6 blocos)
+            num_segmentos_necessarios = max(1, SEGUNDOS_REPLAY // TEMPO_SEGMENTO)
+
+            if len(arquivos) >= 2:
                 arquivos_ordenados = sorted(
                     arquivos,
                     key=lambda x: os.path.getmtime(os.path.join(PASTA_SEGMENTOS, x))
                 )
-                ultimos_segmentos = arquivos_ordenados[-8:-1] if len(arquivos_ordenados) >= 8 else arquivos_ordenados[:-1]
+                # O último elemento [-1] ainda está sendo gravado pelo FFmpeg, então o ignoramos.
+                # Pegamos exatamente os N segmentos anteriores para somar os 30s cravados.
+                inicio_fatia = -(num_segmentos_necessarios + 1)
+                if len(arquivos_ordenados) >= (num_segmentos_necessarios + 1):
+                    ultimos_segmentos = arquivos_ordenados[inicio_fatia:-1]
+                else:
+                    ultimos_segmentos = arquivos_ordenados[:-1]
 
                 with open(lista_txt_path, "w") as f:
                     for seg in ultimos_segmentos:
@@ -269,7 +280,7 @@ def worker_processamento():
                 if os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 1000:
                     sucesso_video = True
                     tarefa["caminho_arquivo"] = arquivo_final
-                    print(f"🎉 [VÍDEO] Replay {tarefa_id} costurado com sucesso!")
+                    print(f"🎉 [VÍDEO] Replay de {len(ultimos_segmentos) * TEMPO_SEGMENTO}s (Lance {tarefa_id}) costurado com sucesso!")
                 else:
                     print(f"❌ [ERRO] Arquivo final {arquivo_final} não foi gerado corretamente.")
             else:
