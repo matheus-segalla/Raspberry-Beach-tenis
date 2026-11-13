@@ -1,12 +1,13 @@
 [Unit]
-Description=Fox Replay Totem Core Service
-After=network.target
+Description=Fox Replay Totem Core Service (Auto-Update via GitHub)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/Raspberry-Beach-tenis
-ExecStart=/usr/bin/python3 /home/pi/Raspberry-Beach-tenis/index.py
+ExecStart=/bin/bash /home/pi/Raspberry-Beach-tenis/iniciar_totem.sh
 Restart=always
 RestartSec=5
 StandardOutput=journal

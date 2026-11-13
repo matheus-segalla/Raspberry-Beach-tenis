@@ -125,4 +125,17 @@ Antes de liberar a quadra para os clientes, faça o teste prático:
 
 ---
 
+## 🚀 8. Atualizações Automáticas (OTA via GitHub)
+
+O sistema conta com um mecanismo inteligente de auto-atualização no boot:
+* Toda vez que o Raspberry Pi for ligado na tomada ou reiniciado com conexão de rede (cabo RJ45), o script `iniciar_totem.sh` executa uma checagem rápida no repositório oficial do GitHub.
+* Se houver melhorias de código publicadas no GitHub:
+  1. O totem baixa as novidades automaticamente;
+  2. Preserva intactas as credenciais locais (`.env` com token da quadra e IP da câmera);
+  3. Atualiza bibliotecas caso o `requirements.txt` tenha mudado;
+  4. Inicia a gravação já na versão mais recente.
+* Se a quadra estiver sem internet momentaneamente, o sistema ignora a checagem e inicia a gravação normalmente com o código local.
+
+---
+
 *Fox Replay — Sistema de Gravação e Replay Esportivo Inteligente.*

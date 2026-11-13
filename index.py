@@ -70,6 +70,11 @@ def acionar_feedback_confirmacao(duracao=1.0):
 
 print("=" * 65)
 print("🦊 FOX REPLAY — TOTEM EDGE CORE (ALTA DISPONIBILIDADE)")
+try:
+    _versao_git = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+    print(f"📦 Versão Instalada: commit {_versao_git}")
+except Exception:
+    pass
 print("=" * 65)
 
 # ==============================================================================
