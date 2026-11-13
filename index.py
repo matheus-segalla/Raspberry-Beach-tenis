@@ -415,8 +415,8 @@ def iniciar_listener_gpio():
 # ==============================================================================
 # PAREAMENTO AUTOMÁTICO (ZERO-TOUCH VIA CÓDIGO DE 6 DÍGITOS)
 # ==============================================================================
-def salvar_token_no_env(token):
-    """Grava o novo token recebido no arquivo .env para persistência nos próximos boots."""
+def salvar_config_no_env(token, camera_url=None):
+    """Grava o novo token e a URL da câmera recebidos no arquivo .env para persistência."""
     try:
         linhas = []
         if os.path.exists('.env'):
@@ -424,22 +424,32 @@ def salvar_token_no_env(token):
                 linhas = f.readlines()
 
         token_atualizado = False
+        camera_atualizada = False
         novas_linhas = []
+
         for l in linhas:
             if l.startswith("TOKEN_DISPOSITIVO="):
                 novas_linhas.append(f"TOKEN_DISPOSITIVO={token}\n")
                 token_atualizado = True
+            elif camera_url and l.startswith("CAMERA_NOME="):
+                novas_linhas.append(f"CAMERA_NOME={camera_url}\n")
+                camera_atualizada = True
             else:
                 novas_linhas.append(l)
 
         if not token_atualizado:
             novas_linhas.append(f"\nTOKEN_DISPOSITIVO={token}\n")
+        if camera_url and not camera_atualizada:
+            novas_linhas.append(f"CAMERA_NOME={camera_url}\n")
 
         with open('.env', 'w', encoding='utf-8') as f:
             f.writelines(novas_linhas)
-        print("💾 Token gravado com sucesso no arquivo .env local!")
+        print("💾 Configurações salvas com sucesso no arquivo .env local!")
     except Exception as e:
         print(f"Aviso ao salvar .env: {e}")
+
+def salvar_token_no_env(token):
+    salvar_config_no_env(token)
 
 def iniciar_modo_pareamento():
     """Gera código de 6 dígitos estilo Smart TV e aguarda ativação pelo celular."""
@@ -486,18 +496,23 @@ def iniciar_modo_pareamento():
     while True:
         time.sleep(3)
         try:
-            url_check = f"{SUPABASE_URL}/rest/v1/pareamentos?codigo=eq.{codigo}&select=status,token_gerado,quadra_id"
+            url_check = f"{SUPABASE_URL}/rest/v1/pareamentos?codigo=eq.{codigo}&select=status,token_gerado,quadra_id,camera_url"
             r = requests.get(url_check, headers=headers, timeout=6)
             if r.status_code == 200:
                 dados = r.json()
                 if dados and len(dados) > 0 and dados[0].get("status") == "vinculado":
                     token = dados[0].get("token_gerado")
                     quadra_id = dados[0].get("quadra_id")
+                    camera_remota = dados[0].get("camera_url")
                     if token and quadra_id:
                         print(f"\n🎉 [SUCESSO TOTAL] Totem pareado e vinculado à quadra {quadra_id}!")
-                        salvar_token_no_env(token)
+                        if camera_remota:
+                            print(f"📹 Câmera configurada remotamente: {camera_remota}")
+                            os.environ['CAMERA_NOME'] = camera_remota
+                        salvar_config_no_env(token, camera_remota)
                         return token, quadra_id
         except Exception:
+            pass
             pass
 
 # ==============================================================================
